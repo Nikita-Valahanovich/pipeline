@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -10,9 +11,10 @@ import (
 	"time"
 )
 
-const bufferDrainInterval time.Duration = 30 * time.Second
-
-const bufferSize int = 10
+const (
+	bufferDrainInterval = 30 * time.Second
+	bufferSize          = 10
+)
 
 type RingIntBuffer struct {
 	array []int
@@ -29,24 +31,24 @@ func (r *RingIntBuffer) Push(el int) {
 	r.m.Lock()
 	defer r.m.Unlock()
 	if r.pos == r.size-1 {
-		for i := 1; i <= r.size-1; i++ {
-			r.array[i-1] = r.array[i]
-		}
+		copy(r.array, r.array[1:])
 		r.array[r.pos] = el
 	} else {
 		r.pos++
 		r.array[r.pos] = el
 	}
+	log.Printf("[BUFFER] Добавлено число: %d\n", el)
 }
 
 func (r *RingIntBuffer) Get() []int {
+	r.m.Lock()
+	defer r.m.Unlock()
 	if r.pos < 0 {
 		return nil
 	}
-	r.m.Lock()
-	defer r.m.Unlock()
-	var output []int = r.array[:r.pos+1]
+	output := append([]int(nil), r.array[:r.pos+1]...)
 	r.pos = -1
+	log.Printf("[BUFFER] Буфер очищен. Отдано: %v\n", output)
 	return output
 }
 
@@ -62,36 +64,37 @@ func NewPipelineInt(done <-chan bool, stages ...StageInt) *PipeLineInt {
 }
 
 func (p *PipeLineInt) Run(source <-chan int) <-chan int {
-	var c <-chan int = source
-	for index := range p.stages {
-		c = p.runStageInt(p.stages[index], c)
+	c := source
+	for _, stage := range p.stages {
+		c = stage(p.done, c)
 	}
 	return c
 }
 
-func (p *PipeLineInt) runStageInt(stage StageInt, sourceChan <-chan int) <-chan int {
-	return stage(p.done, sourceChan)
-}
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	dataSource := func() (<-chan int, <-chan bool) {
 		c := make(chan int)
 		done := make(chan bool)
+
 		go func() {
 			defer close(done)
 			scanner := bufio.NewScanner(os.Stdin)
-			var data string
 			for {
+				fmt.Print("Введите число (или 'exit' для выхода): ")
 				scanner.Scan()
-				data = scanner.Text()
+				data := scanner.Text()
 				if strings.EqualFold(data, "exit") {
-					fmt.Println("Программа завершила работу!")
+					log.Println("[SOURCE] Завершение программы.")
 					return
 				}
 				i, err := strconv.Atoi(data)
 				if err != nil {
-					fmt.Println("Программа обрабатывает только целые числа!")
+					log.Println("[SOURCE] Ошибка: введено не число.")
 					continue
 				}
+				log.Printf("[SOURCE] Прочитано число: %d\n", i)
 				c <- i
 			}
 		}()
@@ -99,96 +102,75 @@ func main() {
 	}
 
 	negativeFilterStageInt := func(done <-chan bool, c <-chan int) <-chan int {
-		convertedIntChan := make(chan int)
+		out := make(chan int)
 		go func() {
-			for {
-				select {
-				case data := <-c:
-					if data > 0 {
-						select {
-						case convertedIntChan <- data:
-						case <-done:
-							return
-						}
-					}
-				case <-done:
-					return
+			defer close(out)
+			for data := range c {
+				if data > 0 {
+					log.Printf("[STAGE 1] Пропущено положительное число: %d\n", data)
+					out <- data
+				} else {
+					log.Printf("[STAGE 1] Отфильтровано отрицательное число: %d\n", data)
 				}
 			}
 		}()
-		return convertedIntChan
+		return out
 	}
 
 	specialFilterStageInt := func(done <-chan bool, c <-chan int) <-chan int {
-		filteredIntChan := make(chan int)
+		out := make(chan int)
 		go func() {
-			for {
-				select {
-				case data := <-c:
-					if data != 0 && data%3 == 0 {
-						select {
-						case filteredIntChan <- data:
-						case <-done:
-							return
-						}
-					}
-				case <-done:
-					return
+			defer close(out)
+			for data := range c {
+				if data%3 == 0 {
+					log.Printf("[STAGE 2] Число %d проходит фильтр (делится на 3)\n", data)
+					out <- data
+				} else {
+					log.Printf("[STAGE 2] Число %d не прошло фильтр (не делится на 3)\n", data)
 				}
 			}
 		}()
-		return filteredIntChan
+		return out
 	}
 
 	bufferStageInt := func(done <-chan bool, c <-chan int) <-chan int {
-		bufferedIntChan := make(chan int)
+		out := make(chan int)
 		buffer := NewRingIntBuffer(bufferSize)
-		go func() {
-			for {
-				select {
-				case data := <-c:
-					buffer.Push(data)
-				case <-done:
-					return
-				}
-			}
-		}()
 
 		go func() {
+			defer close(out)
+			ticker := time.NewTicker(bufferDrainInterval)
+			defer ticker.Stop()
+
 			for {
 				select {
-				case <-time.After(bufferDrainInterval):
-					bufferData := buffer.Get()
-					if bufferData != nil {
-						for _, data := range bufferData {
-							select {
-							case bufferedIntChan <- data:
-							case <-done:
-								return
-							}
-						}
+				case data, ok := <-c:
+					if !ok {
+						return
+					}
+					buffer.Push(data)
+				case <-ticker.C:
+					log.Println("[BUFFER] Время очистки буфера.")
+					for _, data := range buffer.Get() {
+						out <- data
 					}
 				case <-done:
+					log.Println("[BUFFER] Завершение работы.")
 					return
 				}
 			}
 		}()
-		return bufferedIntChan
+		return out
 	}
-	// Потребитель данных от пайплайна
+
 	consumer := func(done <-chan bool, c <-chan int) {
-		for {
-			select {
-			case data := <-c:
-				fmt.Printf("Обработаны данные: %d\n", data)
-			case <-done:
-				return
-			}
+		for data := range c {
+			log.Printf("[CONSUMER] Получено число: %d\n", data)
 		}
+		log.Println("[CONSUMER] Завершение работы.")
 	}
 
 	source, done := dataSource()
-
 	pipeline := NewPipelineInt(done, negativeFilterStageInt, specialFilterStageInt, bufferStageInt)
 	consumer(done, pipeline.Run(source))
 }
